@@ -1,0 +1,524 @@
+// ============================================================================
+// School Exam Analysis System — Prisma Schema
+// Multi-tenant (schoolId scoping), curriculum-agnostic grading (8-4-4/CBC/IGCSE/custom)
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS
+// ----------------------------------------------------------------------------
+
+enum Role {
+  SUPER_ADMIN   // platform operator (SaaS level, not tied to one school)
+  SCHOOL_ADMIN  // full control of one school
+  PRINCIPAL     // aka head teacher: read-all analytics, approves reports
+  CLASS_TEACHER // owns a stream, writes remarks, enters marks for assigned subjects
+  TEACHER       // enters marks only for assigned subject/class combos
+  PARENT        // views own children's results
+  STUDENT       // views own results (if school enables student login)
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum Curriculum {
+  EIGHT_FOUR_FOUR // Kenyan 8-4-4
+  CBC             // Competency Based Curriculum
+  IGCSE
+  CUSTOM
+}
+
+enum ExamType {
+  OPENER
+  MID_TERM
+  END_TERM
+  MOCK
+  NATIONAL
+  CAT           // continuous assessment test
+  CUSTOM
+}
+
+enum ResultStatus {
+  DRAFT       // entered, not yet locked for analytics/reporting
+  SUBMITTED   // teacher submitted, awaiting HoD/Principal approval
+  APPROVED    // locked, feeds analytics + report cards
+  ABSENT
+  EXEMPTED
+}
+
+enum NotificationChannel {
+  SMS
+  EMAIL
+  PUSH
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum SubscriptionStatus {
+  ACTIVE      // paid and within the billing period
+  EXPIRED     // billing period lapsed, access locked
+  TRIAL       // optional free trial window before first payment
+  CANCELLED   // school opted out, access locked
+}
+
+// ----------------------------------------------------------------------------
+// TENANT ROOT
+// ----------------------------------------------------------------------------
+
+model School {
+  id            String   @id @default(cuid())
+  name          String
+  code          String   @unique // short code, e.g. "KEBRG-SEC"
+  county        String?
+  subCounty     String?
+  logoUrl       String?
+  contactEmail  String?
+  contactPhone  String?
+  timezone      String   @default("Africa/Nairobi")
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  users           User[]
+  gradeLevels     GradeLevel[]
+  streams         Stream[]
+  students        Student[]
+  subjects        Subject[]
+  gradingSystems  GradingSystem[]
+  academicYears   AcademicYear[]
+  exams           Exam[]
+  notifications   Notification[]
+  auditLogs       AuditLog[]
+  subscription    Subscription?
+
+  @@index([code])
+}
+
+// ----------------------------------------------------------------------------
+// USERS & AUTH
+// ----------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  schoolId     String?  // null for SUPER_ADMIN
+  school       School?  @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  email        String?  @unique
+  phone        String?  @unique
+  passwordHash String
+  role         Role
+  fullName     String
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  staffProfile   StaffProfile?
+  parentProfile  ParentProfile?
+  studentAccount Student?        @relation("StudentLogin")
+  auditLogs      AuditLog[]
+
+  @@index([schoolId, role])
+}
+
+// Extra fields for teachers/admins/principals
+model StaffProfile {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  staffNumber   String?
+  title         String?  // "Mr", "Mrs", "Dr" etc
+  subjects      TeacherSubject[]
+  classTeacherOf Stream[] @relation("ClassTeacher")
+  remarks       Remark[]
+  createdAt     DateTime @default(now())
+}
+
+// Parent/guardian account — can be linked to multiple students
+model ParentProfile {
+  id       String   @id @default(cuid())
+  userId   String   @unique
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  children StudentGuardian[]
+  createdAt DateTime @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// ACADEMIC STRUCTURE
+// ----------------------------------------------------------------------------
+
+model AcademicYear {
+  id        String   @id @default(cuid())
+  schoolId  String
+  school    School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  year      Int      // e.g. 2026
+  isCurrent Boolean  @default(false)
+  terms     Term[]
+  exams     Exam[]
+
+  @@unique([schoolId, year])
+}
+
+model Term {
+  id             String       @id @default(cuid())
+  academicYearId String
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id], onDelete: Cascade)
+  name           String       // "Term 1", "Term 2", "Term 3"
+  startDate      DateTime?
+  endDate        DateTime?
+  isCurrent      Boolean      @default(false)
+  exams          Exam[]
+  attendance     Attendance[]
+
+  @@unique([academicYearId, name])
+}
+
+// e.g. "Grade 7", "Form 1" — curriculum level, independent of stream/section
+model GradeLevel {
+  id         String     @id @default(cuid())
+  schoolId   String
+  school     School     @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  name       String     // "Form 1", "Grade 7"
+  order      Int        // for sorting (1,2,3,4)
+  curriculum Curriculum @default(EIGHT_FOUR_FOUR)
+  streams    Stream[]
+  classSubjects ClassSubject[]
+
+  @@unique([schoolId, name])
+}
+
+// e.g. "1 East", "7 Blue" — the actual physical class/stream students belong to
+model Stream {
+  id            String       @id @default(cuid())
+  schoolId      String
+  school        School       @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  gradeLevelId  String
+  gradeLevel    GradeLevel   @relation(fields: [gradeLevelId], references: [id], onDelete: Cascade)
+  name          String       // "East", "Blue", "A"
+  classTeacherId String?
+  classTeacher  StaffProfile? @relation("ClassTeacher", fields: [classTeacherId], references: [id])
+  students      Student[]
+
+  @@unique([gradeLevelId, name])
+}
+
+// ----------------------------------------------------------------------------
+// STUDENTS & GUARDIANS
+// ----------------------------------------------------------------------------
+
+model Student {
+  id             String    @id @default(cuid())
+  schoolId       String
+  school         School    @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  admissionNo    String
+  fullName       String
+  gender         Gender
+  dateOfBirth    DateTime?
+  streamId       String
+  stream         Stream    @relation(fields: [streamId], references: [id])
+  hasDisability  Boolean   @default(false)
+  disabilityNote String?
+  isActive       Boolean   @default(true) // false = transferred/left
+  photoUrl       String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  // optional login for the student portal
+  userId   String? @unique
+  user     User?   @relation("StudentLogin", fields: [userId], references: [id])
+
+  guardians StudentGuardian[]
+  results   Result[]
+  attendance Attendance[]
+  remarks   Remark[]
+
+  @@unique([schoolId, admissionNo])
+  @@index([schoolId, streamId])
+}
+
+// Many-to-many: a student can have multiple guardians, a guardian multiple children
+model StudentGuardian {
+  id        String        @id @default(cuid())
+  studentId String
+  student   Student       @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  parentId  String
+  parent    ParentProfile @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  relation  String        @default("Parent") // "Mother", "Father", "Guardian"
+  isPrimaryContact Boolean @default(false)
+
+  @@unique([studentId, parentId])
+}
+
+// ----------------------------------------------------------------------------
+// SUBJECTS
+// ----------------------------------------------------------------------------
+
+model Subject {
+  id        String   @id @default(cuid())
+  schoolId  String
+  school    School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  name      String   // "Mathematics"
+  code      String   // "MATH"
+  isCore    Boolean  @default(true) // core vs optional/elective
+  defaultMaxScore Float @default(100)
+
+  classSubjects  ClassSubject[]
+  teacherSubjects TeacherSubject[]
+  examSubjects   ExamSubject[]
+  results        Result[]
+
+  @@unique([schoolId, code])
+}
+
+// Which subjects are offered at which grade level, and who teaches them
+model ClassSubject {
+  id           String     @id @default(cuid())
+  gradeLevelId String
+  gradeLevel   GradeLevel @relation(fields: [gradeLevelId], references: [id], onDelete: Cascade)
+  subjectId    String
+  subject      Subject    @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  @@unique([gradeLevelId, subjectId])
+}
+
+// Which teacher teaches which subject (assignment used for permission-scoping mark entry)
+model TeacherSubject {
+  id        String       @id @default(cuid())
+  staffId   String
+  staff     StaffProfile @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  subjectId String
+  subject   Subject      @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  streamId  String?      // optional: restrict to one stream, else all streams of that subject
+
+  @@unique([staffId, subjectId, streamId])
+}
+
+// ----------------------------------------------------------------------------
+// GRADING ENGINE (curriculum-agnostic)
+// ----------------------------------------------------------------------------
+
+// A named grading configuration, e.g. "KCSE 8-4-4 Standard", "CBC Performance Levels"
+model GradingSystem {
+  id         String     @id @default(cuid())
+  schoolId   String
+  school     School     @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  name       String
+  curriculum Curriculum
+  isDefault  Boolean    @default(false)
+  bands      GradeBand[]
+  exams      Exam[]
+
+  @@unique([schoolId, name])
+}
+
+// A single band within a grading system, e.g. 80-100 => A, 12 points, "Exceeding Expectation"
+model GradeBand {
+  id              String        @id @default(cuid())
+  gradingSystemId String
+  gradingSystem   GradingSystem @relation(fields: [gradingSystemId], references: [id], onDelete: Cascade)
+  minPercentage   Float         // inclusive
+  maxPercentage   Float         // inclusive
+  label           String        // "A", "EE", "A*"
+  points          Float         // numeric weight for mean-grade computation
+  remark          String?       // "Excellent", "Exceeding Expectation"
+
+  @@index([gradingSystemId])
+}
+
+// ----------------------------------------------------------------------------
+// EXAMS
+// ----------------------------------------------------------------------------
+
+model Exam {
+  id             String        @id @default(cuid())
+  schoolId       String
+  school         School        @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  academicYearId String
+  academicYear   AcademicYear  @relation(fields: [academicYearId], references: [id], onDelete: Cascade)
+  termId         String
+  term           Term          @relation(fields: [termId], references: [id], onDelete: Cascade)
+  name           String        // "Mid Term Exam"
+  examType       ExamType      @default(MID_TERM)
+  gradingSystemId String
+  gradingSystem  GradingSystem @relation(fields: [gradingSystemId], references: [id])
+  weighting      Float         @default(1.0) // contribution to a composite/termly average
+  examDate       DateTime?
+  isPublished    Boolean       @default(false) // controls parent/student visibility
+  createdAt      DateTime      @default(now())
+
+  examSubjects ExamSubject[]
+  results      Result[]
+
+  @@index([schoolId, termId])
+}
+
+// Per-exam override of max score for a subject (e.g. a CAT out of 30 instead of 100)
+model ExamSubject {
+  id        String  @id @default(cuid())
+  examId    String
+  exam      Exam    @relation(fields: [examId], references: [id], onDelete: Cascade)
+  subjectId String
+  subject   Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  maxScore  Float   @default(100)
+
+  @@unique([examId, subjectId])
+}
+
+// ----------------------------------------------------------------------------
+// RESULTS (the atomic mark: one student, one subject, one exam)
+// ----------------------------------------------------------------------------
+
+model Result {
+  id         String       @id @default(cuid())
+  schoolId   String       // denormalized for fast tenant-scoped queries
+  studentId  String
+  student    Student      @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  examId     String
+  exam       Exam         @relation(fields: [examId], references: [id], onDelete: Cascade)
+  subjectId  String
+  subject    Subject      @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  rawScore   Float?       // null if absent/exempted
+  maxScore   Float        // copied from ExamSubject/Subject at entry time (immutable snapshot)
+  percentage Float?       // computed = rawScore/maxScore*100
+  points     Float?       // computed from GradeBand
+  gradeLabel String?      // computed from GradeBand, e.g. "A", "EE"
+  status     ResultStatus @default(DRAFT)
+
+  enteredById String?     // User.id of the teacher who entered it
+  enteredAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@unique([studentId, examId, subjectId]) // one mark per student/subject/exam
+  @@index([schoolId, examId, subjectId])
+  @@index([schoolId, studentId])
+}
+
+// ----------------------------------------------------------------------------
+// ATTENDANCE
+// ----------------------------------------------------------------------------
+
+model Attendance {
+  id        String   @id @default(cuid())
+  studentId String
+  student   Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  termId    String
+  term      Term     @relation(fields: [termId], references: [id], onDelete: Cascade)
+  daysPresent Int
+  daysAbsent  Int
+  daysTotal   Int
+
+  @@unique([studentId, termId])
+}
+
+// ----------------------------------------------------------------------------
+// REMARKS / COMMENTS (report card free-text: teacher, class teacher, principal)
+// ----------------------------------------------------------------------------
+
+model Remark {
+  id        String        @id @default(cuid())
+  studentId String
+  student   Student       @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  examId    String        // scope the remark to one exam/report card
+  authorId  String
+  author    StaffProfile  @relation(fields: [authorId], references: [id])
+  role      Role          // TEACHER / CLASS_TEACHER / PRINCIPAL — which slot on the report card
+  text      String
+  createdAt DateTime      @default(now())
+
+  @@index([studentId, examId])
+}
+
+// ----------------------------------------------------------------------------
+// NOTIFICATIONS
+// ----------------------------------------------------------------------------
+
+model Notification {
+  id        String              @id @default(cuid())
+  schoolId  String
+  school    School              @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  channel   NotificationChannel
+  recipient String              // phone or email
+  message   String
+  status    NotificationStatus  @default(PENDING)
+  sentAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  @@index([schoolId, status])
+}
+
+// ----------------------------------------------------------------------------
+// AUDIT LOG (who changed which mark, when — important for exam-integrity disputes)
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  schoolId  String
+  school    School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String   // "RESULT_UPDATE", "RESULT_CREATE", "STUDENT_IMPORT" ...
+  entity    String   // "Result", "Student" ...
+  entityId  String
+  before    Json?
+  after     Json?
+  createdAt DateTime @default(now())
+
+  @@index([schoolId, entity, entityId])
+}
+
+// ----------------------------------------------------------------------------
+// SUBSCRIPTION & BILLING (Testy Analytics access control)
+// ----------------------------------------------------------------------------
+
+// One row per school. Access to the whole API is gated on
+// `status === ACTIVE && expiresAt > now()` — enforced by the
+// requireActiveSubscription middleware on every authenticated route.
+model Subscription {
+  id            String             @id @default(cuid())
+  schoolId      String             @unique
+  school        School             @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  planName      String             @default("Standard Annual")
+  amount        Float              @default(5000) // KES
+  currency      String             @default("KES")
+  status        SubscriptionStatus @default(TRIAL)
+  startedAt     DateTime           @default(now())
+  expiresAt     DateTime           // access locks automatically once this passes
+  autoRenew     Boolean            @default(false)
+  lastCheckedAt DateTime           @default(now()) // last time the expiry sweep touched this row
+  payments      Payment[]
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([status, expiresAt])
+}
+
+// A single payment/renewal event (e.g. an M-Pesa STK push confirmation).
+// Each successful payment extends Subscription.expiresAt by one billing cycle.
+model Payment {
+  id             String       @id @default(cuid())
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  amount         Float
+  currency       String       @default("KES")
+  method         String       @default("MPESA") // MPESA, BANK, CASH, MANUAL
+  reference      String?      // M-Pesa transaction code etc.
+  paidAt         DateTime     @default(now())
+  extendsUntil   DateTime     // new expiresAt this payment resulted in
+
+  @@index([subscriptionId])
+}
